@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: paddleocr-api-wrapper
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PADDLE_API_KEY
+        sync: true
+      - key: PADDLE_BASE_URL
+        sync: true
+      - key: PADDLE_API_SECRET
+        sync: true
+        value: ""
+      - key: MODEL
+        value: "PaddleOCR-VL-1.5"
+      - key: POLL_INTERVAL
+        value: "5"
+      - key: MAX_WAIT_SECONDS
+        value: "300"
