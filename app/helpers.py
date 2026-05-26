@@ -1,10 +1,17 @@
 import re
+import io
 import json
 import time
 import asyncio
 import httpx
-from typing import Dict, List
+import logging
+from typing import Optional, Dict, List
 from fastapi import HTTPException, status
+from pydantic import BaseModel, Field
+from PIL import Image, UnidentifiedImageError
+from google import genai
+from google.genai.errors import APIError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from app.config import (
     PADDLE_BASE_URL,
@@ -12,27 +19,55 @@ from app.config import (
     PADDLE_MODEL,
     POLL_INTERVAL,
     MAX_WAIT_SECONDS,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
     logger,
 )
 from app.schemas import OCRResult
 
-# Validation limits
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB limit
-ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf"}
-ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "application/pdf"}
+# --- PaddleOCR Validation Limits ---
+PADDLE_MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB limit
+PADDLE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf"}
+PADDLE_ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "application/pdf"}
 
+# --- Gemini Validation Limits ---
+GEMINI_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB limit
+GEMINI_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+GEMINI_ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+
+# Initialize Gemini Client if API key is present
+client: Optional[genai.Client] = None
+if GEMINI_API_KEY:
+    logger.info("Initializing Google GenAI client...")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    logger.warning("GEMINI_API_KEY not configured. client will be initialized as None.")
+
+
+class EquipmentOCRResult(BaseModel):
+    """Structured response schema returned directly from the Gemini OCR generation call."""
+    markdown: str = Field(
+        description=(
+            "All extracted text formatted as a markdown string, "
+            "preserving the label's line structure. "
+            "Example: 'MÁY HÀN CO2\\n\\nMã MMTB : B001\\n\\nModel : X1'"
+        )
+    )
+    machine_name: str = Field(description="Full machine/equipment name as it appears on the label")
+    ma_mmtb: str = Field(description="Equipment ID code labelled 'Mã MMTB'")
+    model: str = Field(description="Model number labelled 'Model'")
+    xuong: str = Field(description="Workshop / xưởng value")
+    vi_tri: str = Field(description="Location value labelled 'Vị trí'")
+
+
+# ── PaddleOCR Helper Functions ──────────────────────────────────────────────
 
 def parse_markdown_to_key_value(markdown_text: str) -> Dict[str, str]:
-    """Extracts structured key-value maps from PaddleOCR's page markdown output.
-    - Captures titles/headers from the first line as 'machine_name' if no colon is present.
-    - Identifies 'Key: Value' and 'Key：Value' structures on subsequent lines.
-    - Preserves all Vietnamese accents and characters exactly.
-    """
+    """Extracts structured key-value maps from PaddleOCR's page markdown output."""
     key_value = {}
     if not markdown_text:
         return key_value
 
-    # Parse lines that are not empty
     lines = [line.strip() for line in markdown_text.split("\n") if line.strip()]
     if not lines:
         return key_value
@@ -41,7 +76,6 @@ def parse_markdown_to_key_value(markdown_text: str) -> Dict[str, str]:
     first_line = lines[0]
     first_line_clean = re.sub(r"^#+\s*", "", first_line).strip()
     
-    # If first line contains no colons, assign it to machine_name
     if first_line_clean and ":" not in first_line_clean and "：" not in first_line_clean:
         key_value["machine_name"] = first_line_clean
 
@@ -54,7 +88,6 @@ def parse_markdown_to_key_value(markdown_text: str) -> Dict[str, str]:
             k = match.group(1).strip()
             v = match.group(2).strip()
 
-            # Clean residual markdown artifacts
             k = re.sub(r"^\*+\s*|\s*\*+$", "", k).strip()
             v = re.sub(r"^\*+\s*|\s*\*+$", "", v).strip()
 
@@ -64,8 +97,8 @@ def parse_markdown_to_key_value(markdown_text: str) -> Dict[str, str]:
     return key_value
 
 
-def validate_upload(filename: str, content_type: str, file_size: int):
-    """Checks uploaded file extensions, MIME-types, and size limits."""
+def validate_upload_paddle(filename: str, content_type: str, file_size: int):
+    """Checks uploaded file extensions, MIME-types, and size limits for PaddleOCR."""
     import os
 
     if not filename:
@@ -75,22 +108,22 @@ def validate_upload(filename: str, content_type: str, file_size: int):
         )
 
     ext = os.path.splitext(filename.lower())[1]
-    if ext not in ALLOWED_EXTENSIONS:
+    if ext not in PADDLE_ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file extension '{ext}'. Allowed extensions: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Unsupported file extension '{ext}'. Allowed extensions: {', '.join(PADDLE_ALLOWED_EXTENSIONS)}"
         )
 
-    if content_type not in ALLOWED_MIME_TYPES:
+    if content_type not in PADDLE_ALLOWED_MIME_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported MIME type '{content_type}'. Allowed types: {', '.join(ALLOWED_MIME_TYPES)}"
+            detail=f"Unsupported MIME type '{content_type}'. Allowed types: {', '.join(PADDLE_ALLOWED_MIME_TYPES)}"
         )
 
-    if file_size > MAX_FILE_SIZE:
+    if file_size > PADDLE_MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File exceeds maximum allowed size. Size: {file_size} bytes, Max: {MAX_FILE_SIZE} bytes (20MB)."
+            detail=f"File exceeds maximum allowed size. Size: {file_size} bytes, Max: {PADDLE_MAX_FILE_SIZE} bytes (20MB)."
         )
 
 
@@ -283,12 +316,116 @@ async def download_and_parse_jsonl(jsonl_url: str) -> List[OCRResult]:
 
 
 async def check_paddle_connectivity() -> bool:
-    """Validates external endpoint availability."""
+    """Validates external endpoint availability for PaddleOCR."""
+    if not PADDLE_API_KEY or not PADDLE_BASE_URL:
+        return False
     headers = {"Authorization": f"bearer {PADDLE_API_KEY}"}
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(PADDLE_BASE_URL, headers=headers, timeout=2.0)
+            await client.get(PADDLE_BASE_URL, headers=headers, timeout=2.0)
             return True
     except Exception as exc:
         logger.warning(f"Paddle connection check failed: {exc}")
+        return False
+
+
+# ── Gemini OCR Helper Functions ─────────────────────────────────────────────
+
+def validate_upload_gemini(filename: str, content_type: str, file_size: int):
+    """Validates the uploaded file extension, MIME type, and size restrictions for Gemini OCR."""
+    import os
+
+    if not filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file has an empty filename."
+        )
+
+    ext = os.path.splitext(filename.lower())[1]
+    if ext not in GEMINI_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file extension '{ext}'. Allowed extensions: {', '.join(GEMINI_ALLOWED_EXTENSIONS)}"
+        )
+
+    if content_type not in GEMINI_ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported MIME type '{content_type}'. Allowed types: {', '.join(GEMINI_ALLOWED_MIME_TYPES)}"
+        )
+
+    if file_size > GEMINI_MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File exceeds maximum allowed size. Size: {file_size} bytes, Max: {GEMINI_MAX_FILE_SIZE} bytes (5MB)."
+        )
+
+
+def verify_image_bytes(content: bytes) -> Image.Image:
+    """Attempts to parse and verify the image bytes using PIL."""
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.verify()
+        image = Image.open(io.BytesIO(content))
+        return image
+    except (UnidentifiedImageError, Exception) as img_err:
+        logger.error(f"Image verification failed: {img_err}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is not a valid image."
+        )
+
+
+def is_rate_limit_error(exception: Exception) -> bool:
+    """Helper filter for tenacity to retry on 429/RESOURCE_EXHAUSTED API errors."""
+    if isinstance(exception, APIError):
+        is_429 = exception.code == 429 or exception.status == "RESOURCE_EXHAUSTED"
+        if is_429:
+            logger.warning("Gemini API rate limit hit (429/RESOURCE_EXHAUSTED). Triggering tenacity retry...")
+            return True
+    return False
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(is_rate_limit_error),
+    reraise=True
+)
+def call_gemini_ocr(image: Image.Image) -> genai.types.GenerateContentResponse:
+    """Synchronous Gemini model call. Wrapped in tenacity retry policy."""
+    if not client:
+        logger.error("Attempted to call Gemini OCR but client is not initialized.")
+        raise RuntimeError("Gemini Client is not initialized due to missing API key.")
+
+    logger.info(f"Executing Gemini {GEMINI_MODEL} structured OCR request...")
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            image,
+            "Perform OCR on this equipment label image. "
+            "Extract the following fields: markdown, machine_name, ma_mmtb, model, xuong, vi_tri. "
+            "For 'markdown', reproduce all visible text preserving line breaks. "
+            "Extract all other fields exactly as they appear on the label."
+        ],
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": EquipmentOCRResult,
+        }
+    )
+    return response
+
+
+async def check_gemini_connectivity() -> bool:
+    """Asynchronously checks Gemini credentials and network connectivity."""
+    if not client:
+        return False
+    try:
+        def _check():
+            for _ in client.models.list(config={"page_size": 1}):
+                return True
+            return False
+        return await asyncio.to_thread(_check)
+    except Exception as exc:
+        logger.warning(f"Gemini connection health check failed: {exc}")
         return False
