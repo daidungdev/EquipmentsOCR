@@ -480,26 +480,67 @@ def get_gspread_client():
     return _gspread_client
 
 
+# ── Google Sheets Normalization Maps ─────────────────────────────────────────
+KEY_MAPPING = {
+    "Mã MMTB": ["mã mmtb", "mã máy", "ma mmtb", "ma may"],
+    "Model": ["model", "mô hình"],
+    "Xưởng": ["xưởng", "xương", "xuong"],
+    "Vị trí": ["vị trí", "trí", "vị tri", "vi tri"]
+}
+
+
+def get_standardized_value(key_value_dict: Dict[str, str], standard_key: str) -> str:
+    """Finds value from a key-value dictionary using primary key or fuzzy aliases."""
+    if not key_value_dict:
+        return ""
+        
+    # Step 1: Try exact match first
+    if standard_key in key_value_dict:
+        return key_value_dict[standard_key]
+        
+    # Step 2: Try spelling variation aliases (case and whitespace insensitive)
+    aliases = KEY_MAPPING.get(standard_key, [])
+    for key in key_value_dict.keys():
+        if key.lower().strip() in aliases:
+            return key_value_dict[key]
+            
+    return ""
+
+
 def extract_row_data(kv: Dict[str, str]) -> List[str]:
-    """Robustly maps key-value dictionaries to Google Sheets column indices."""
+    """Robustly standardizes key-value mappings for Google Sheets columns."""
     if not kv:
         return ["", "", "", "", ""]
         
-    def get_val(keys: List[str]) -> str:
-        for k in keys:
-            if k in kv:
-                return kv[k]
-            # Case insensitive check and spacing normalization
-            for ok in kv:
-                if ok.lower().strip() == k.lower().strip():
-                    return kv[ok]
-        return ""
+    # Extract machine name using robust standard fallbacks
+    machine_name = ""
+    for k in ["machine_name", "TÊN MMTB", "tên mmtb", "tên thiết bị", "machine name"]:
+        if k in kv:
+            machine_name = kv[k]
+            break
+        # Case insensitive fallback
+        matched = False
+        for ok in kv:
+            if ok.lower().strip() == k.lower().strip():
+                machine_name = kv[ok]
+                matched = True
+                break
+        if matched:
+            break
 
-    machine_name = get_val(["machine_name", "TÊN MMTB", "tên mmtb", "tên thiết bị", "machine name"])
-    ma_mmtb = get_val(["Mã MMTB", "ma_mmtb", "mã mmtb", "mã thiết bị", "equipment id", "equipment code"])
-    model = get_val(["Model", "model", "MODEL"])
-    xuong = get_val(["Xưởng", "xuong", "xưởng", "XƯỞNG", "workshop"])
-    vi_tri = get_val(["Vị trí", "vi_tri", "vị trí", "VỊ TRÍ", "location"])
+    # Standardize other fields using the key mapping Aliases
+    ma_mmtb = get_standardized_value(kv, "Mã MMTB")
+    model = get_standardized_value(kv, "Model")
+    xuong = get_standardized_value(kv, "Xưởng")
+    vi_tri = get_standardized_value(kv, "Vị trí")
+
+    # If Model is empty but is written in the machine name, extract it
+    if not model and machine_name and "model" in machine_name.lower():
+        parts = re.split(r'(?i)model', machine_name)
+        if len(parts) > 1:
+            model = parts[1].strip()
+            # Clean up leading punctuation/separators
+            model = re.sub(r'^[:：\-=\s]+', '', model).strip()
 
     return [machine_name, ma_mmtb, model, xuong, vi_tri]
 
