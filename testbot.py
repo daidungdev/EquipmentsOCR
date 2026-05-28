@@ -1,0 +1,525 @@
+import os
+import json
+import logging
+import asyncio
+import requests
+
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+from app.helpers import append_results_to_sheet_sync
+from app.schemas import OCRResult
+
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# ─────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────
+load_dotenv()
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Build API base URL.
+# Priority: API_BASE_URL > OCR_API_URL (legacy, path stripped automatically)
+API_BASE_URL = os.getenv("API_BASE_URL", "").strip().rstrip("/")
+if not API_BASE_URL:
+    _ocr_url = os.getenv("OCR_API_URL", "").strip().rstrip("/")
+    for _suffix in ["/parse-text-gemini", "/parse-text"]:
+        if _ocr_url.endswith(_suffix):
+            _ocr_url = _ocr_url[: -len(_suffix)]
+            break
+    API_BASE_URL = _ocr_url
+
+PADDLE_ENDPOINT = f"{API_BASE_URL}/parse-text"
+GEMINI_ENDPOINT = f"{API_BASE_URL}/parse-text-gemini"
+
+# ─────────────────────────────────────────────
+# Conversation States
+# ─────────────────────────────────────────────
+SELECT_ENGINE, CONFIRM_RESULT, EDIT_FIELD, CONFIRM_SAVE = range(4)
+
+# Callback data constants
+CB_PADDLE       = "engine:paddle"
+CB_GEMINI       = "engine:gemini"
+CB_CONFIRM_YES  = "confirm:yes"
+CB_CONFIRM_EDIT = "confirm:edit"
+CB_SAVE_CONFIRM = "save:confirm"
+CB_SAVE_EDIT    = "save:edit_again"
+
+# Fields to loop through during correction: (display label, key_value dict key)
+FIELDS = [
+    ("🏷️ Tên thiết bị", "machine_name"),
+    ("🔢 Mã MMTB",      "Mã MMTB"),
+    ("📦 Model",        "Model"),
+    ("🏭 Xưởng",        "Xưởng"),
+    ("📍 Vị trí",       "Vị trí"),
+]
+
+
+# ─────────────────────────────────────────────
+# Helper: get value from kv dict
+# Tries exact key first, then case-insensitive fallback
+# ─────────────────────────────────────────────
+def _get_kv(kv: dict, key: str) -> str:
+    val = kv.get(key, "").strip()
+    if not val:
+        for k, v in kv.items():
+            if k.lower().strip() == key.lower().strip():
+                val = v.strip()
+                break
+    return val or "—"
+
+
+# ─────────────────────────────────────────────
+# Helper: format OCR result as readable message
+# ─────────────────────────────────────────────
+def _format_result(kv: dict, markdown_text: str, engine_name: str, processing_time) -> str:
+    msg  = f"📋 *Kết quả OCR* — _{engine_name}_\n"
+    msg += f"⏱ Thời gian xử lý: `{processing_time}s`\n\n"
+    for label, key in FIELDS:
+        msg += f"{label}: *{_get_kv(kv, key)}*\n"
+    if markdown_text:
+        snippet = markdown_text[:600]
+        if len(markdown_text) > 600:
+            snippet += "\n... (truncated)"
+        msg += f"\n📝 *Văn bản gốc:*\n```\n{snippet}\n```"
+    return msg
+
+
+# ─────────────────────────────────────────────
+# /start command
+# ─────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "👋 *Chào mừng đến với Equipment OCR Bot!*\n\n"
+        "📸 Gửi ảnh nhãn thiết bị để bắt đầu.\n\n"
+        "• 🔵 *Paddle OCR* — hỗ trợ ảnh & PDF\n"
+        "• ✨ *Gemini OCR* — nhanh hơn, chỉ hỗ trợ ảnh\n\n"
+        "/help để xem hướng dẫn.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# /help command
+# ─────────────────────────────────────────────
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Hướng dẫn sử dụng*\n\n"
+        "1. Gửi ảnh nhãn máy/thiết bị vào chat\n"
+        "2. Chọn engine OCR (Paddle hoặc Gemini)\n"
+        "3. Kiểm tra kết quả và xác nhận hoặc sửa\n"
+        "4. Dữ liệu được lưu vào Google Sheets\n\n"
+        "*Lệnh:*\n"
+        "/start  — Bắt đầu lại\n"
+        "/cancel — Huỷ thao tác hiện tại\n"
+        "/help   — Xem hướng dẫn này",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# /cancel command  (available at any state)
+# ─────────────────────────────────────────────
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🚫 Đã huỷ thao tác. Gửi ảnh mới để bắt đầu lại."
+    )
+    return ConversationHandler.END
+
+
+# ═════════════════════════════════════════════
+# STEP 1 — Photo received → ask engine
+# ═════════════════════════════════════════════
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]          # largest available resolution
+    context.user_data["pending_file_id"] = photo.file_id
+
+    keyboard = [[
+        InlineKeyboardButton("🔵 Paddle OCR", callback_data=CB_PADDLE),
+        InlineKeyboardButton("✨ Gemini OCR", callback_data=CB_GEMINI),
+    ]]
+    await update.message.reply_text(
+        "🖼️ Ảnh đã nhận! Chọn engine OCR để xử lý:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return SELECT_ENGINE
+
+
+# ═════════════════════════════════════════════
+# STEP 2 — Engine chosen → run OCR → show result + confirm buttons
+# ═════════════════════════════════════════════
+async def handle_engine_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    engine      = query.data
+    file_id     = context.user_data.get("pending_file_id")
+    engine_name = "Paddle OCR" if engine == CB_PADDLE else "Gemini OCR"
+    endpoint    = PADDLE_ENDPOINT if engine == CB_PADDLE else GEMINI_ENDPOINT
+
+    context.user_data["engine_name"] = engine_name
+
+    await query.edit_message_text(
+        f"⏳ Đang xử lý với *{engine_name}*...",
+        parse_mode="Markdown",
+    )
+
+    try:
+        # ── Download image from Telegram ──────────────
+        telegram_file = await context.bot.get_file(file_id)
+        image_bytes   = bytes(await telegram_file.download_as_bytearray())
+        logging.info(f"Downloaded image ({len(image_bytes)} bytes) → {endpoint}")
+
+        # ── POST to FastAPI OCR endpoint ───────────────
+        response = requests.post(
+            endpoint,
+            files=[("files", ("image.jpg", image_bytes, "image/jpeg"))],
+            timeout=120,
+        )
+        logging.info(f"API status: {response.status_code}")
+
+        if response.status_code != 200:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    f"❌ API lỗi `{response.status_code}`:\n"
+                    f"```\n{response.text[:400]}\n```"
+                ),
+                parse_mode="Markdown",
+            )
+            return ConversationHandler.END
+
+        data            = response.json()
+        results         = data.get("results", [])
+        processing_time = data.get("processing_time", "?")
+
+        if not results:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="⚠️ Không tìm thấy kết quả OCR trong phản hồi.",
+            )
+            return ConversationHandler.END
+
+        # Store OCR result in user_data for the correction loop
+        result        = results[0]
+        kv            = dict(result.get("key_value", {}))
+        markdown_text = result.get("markdown", "")
+
+        context.user_data["kv"]              = kv
+        context.user_data["markdown_text"]   = markdown_text
+        context.user_data["processing_time"] = processing_time
+
+        # ── Send formatted summary ─────────────────────
+        formatted   = _format_result(kv, markdown_text, engine_name, processing_time)
+        pretty_json = json.dumps(result, ensure_ascii=False, indent=2)
+        if len(pretty_json) > 3000:
+            pretty_json = pretty_json[:3000] + "\n... (truncated)"
+
+        confirm_kb = [[
+            InlineKeyboardButton("✅ Đúng, lưu lại", callback_data=CB_CONFIRM_YES),
+            InlineKeyboardButton("✏️ Sai, sửa lại",  callback_data=CB_CONFIRM_EDIT),
+        ]]
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=formatted,
+            parse_mode="Markdown",
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"🗂️ *Raw JSON:*\n```json\n{pretty_json}\n```",
+            parse_mode="Markdown",
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="❓ *Thông tin trên có chính xác không?*",
+            reply_markup=InlineKeyboardMarkup(confirm_kb),
+            parse_mode="Markdown",
+        )
+        return CONFIRM_RESULT
+
+    except requests.exceptions.Timeout:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="❌ API timeout. Hãy thử lại sau.",
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        logging.exception(e)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Lỗi không xác định:\n`{str(e)}`",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+
+# ═════════════════════════════════════════════
+# STEP 3 — Confirmation response
+# ═════════════════════════════════════════════
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == CB_CONFIRM_YES:
+        # Guard: prevent double-save if handler is somehow re-entered
+        if context.user_data.get("sheets_saved"):
+            await query.edit_message_text(
+                "✅ Dữ liệu đã được lưu rồi. Gửi ảnh mới để tiếp tục."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        # Save to Google Sheets — triggered ONLY by explicit user confirmation
+        await query.edit_message_text(
+            "💾 *Đang lưu dữ liệu vào Google Sheets...*",
+            parse_mode="Markdown",
+        )
+        logging.info("[BOT] Saving to Google Sheets triggered from TELEGRAM_CONFIRM step")
+        try:
+            kv         = context.user_data["kv"]
+            ocr_result = OCRResult(
+                markdown=context.user_data.get("markdown_text", ""),
+                key_value=kv,
+            )
+            await asyncio.to_thread(
+                append_results_to_sheet_sync, [ocr_result], "TELEGRAM_CONFIRM"
+            )
+            context.user_data["sheets_saved"] = True
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="✅ *Thông tin đã xác nhận và lưu vào Google Sheets!*\n\n"
+                     "Gửi ảnh mới để tiếp tục.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logging.exception(e)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"⚠️ Lưu vào Google Sheets thất bại:\n`{str(e)}`",
+                parse_mode="Markdown",
+            )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # ── CB_CONFIRM_EDIT: start field-by-field correction ──
+    await query.edit_message_text(
+        "✏️ *Bắt đầu sửa thông tin...*\n\n"
+        "Gửi `-` nếu muốn *giữ nguyên* giá trị hiện tại.",
+        parse_mode="Markdown",
+    )
+    context.user_data["field_index"] = 0
+    return await _ask_next_field(context, query.message.chat_id)
+
+
+# ─────────────────────────────────────────────
+# Helper: send prompt for the current field
+# ─────────────────────────────────────────────
+async def _ask_next_field(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    idx = context.user_data["field_index"]
+    kv  = context.user_data["kv"]
+
+    if idx >= len(FIELDS):
+        # All fields processed → show corrected summary
+        return await _show_correction_summary(context, chat_id)
+
+    label, key = FIELDS[idx]
+    current    = _get_kv(kv, key)
+    progress   = f"{idx + 1}/{len(FIELDS)}"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📝 *({progress}) {label}*\n\n"
+            f"Hiện tại: `{current}`\n\n"
+            "Nhập giá trị mới, hoặc gửi `-` để giữ nguyên:"
+        ),
+        parse_mode="Markdown",
+    )
+    return EDIT_FIELD
+
+
+# ═════════════════════════════════════════════
+# STEP 4 — Receive text input for each field
+# ═════════════════════════════════════════════
+async def handle_field_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    idx        = context.user_data["field_index"]
+    kv         = context.user_data["kv"]
+    label, key = FIELDS[idx]
+
+    if user_input == "-":
+        current = _get_kv(kv, key)
+        await update.message.reply_text(
+            f"↩️ Giữ nguyên *{label}*: `{current}`",
+            parse_mode="Markdown",
+        )
+    else:
+        kv[key] = user_input
+        context.user_data["kv"] = kv
+        await update.message.reply_text(
+            f"✔️ Đã cập nhật *{label}*: `{user_input}`",
+            parse_mode="Markdown",
+        )
+
+    # Advance to next field
+    context.user_data["field_index"] = idx + 1
+    return await _ask_next_field(context, update.message.chat_id)
+
+
+# ─────────────────────────────────────────────
+# Helper: show corrected summary + save / edit-again buttons
+# ─────────────────────────────────────────────
+async def _show_correction_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    kv            = context.user_data["kv"]
+    markdown_text = context.user_data.get("markdown_text", "")
+    engine_name   = context.user_data.get("engine_name", "OCR")
+    proc_time     = context.user_data.get("processing_time", "?")
+
+    formatted = "✏️ *Thông tin đã sửa:*\n\n" + _format_result(
+        kv, markdown_text, engine_name, proc_time
+    )
+
+    save_kb = [[
+        InlineKeyboardButton("💾 Xác nhận & Lưu", callback_data=CB_SAVE_CONFIRM),
+        InlineKeyboardButton("🔁 Sửa lại từ đầu",  callback_data=CB_SAVE_EDIT),
+    ]]
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=formatted,
+        reply_markup=InlineKeyboardMarkup(save_kb),
+        parse_mode="Markdown",
+    )
+    return CONFIRM_SAVE
+
+
+# ═════════════════════════════════════════════
+# STEP 5 — Final save confirmation
+# ═════════════════════════════════════════════
+async def handle_save_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == CB_SAVE_EDIT:
+        # Restart field loop from the beginning
+        context.user_data["field_index"] = 0
+        await query.edit_message_text(
+            "🔁 *Sửa lại từ đầu...*\n\nGửi `-` nếu muốn giữ nguyên.",
+            parse_mode="Markdown",
+        )
+        return await _ask_next_field(context, query.message.chat_id)
+
+    # ── CB_SAVE_CONFIRM: append corrected row to Google Sheets ──
+    # Guard: prevent double-save if handler is somehow re-entered
+    if context.user_data.get("sheets_saved"):
+        await query.edit_message_text(
+            "✅ Dữ liệu đã được lưu rồi. Gửi ảnh mới để tiếp tục."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "💾 *Đang lưu dữ liệu đã sửa vào Google Sheets...*",
+        parse_mode="Markdown",
+    )
+    logging.info("[BOT] Saving to Google Sheets triggered from TELEGRAM_CORRECTED_CONFIRM step")
+
+    try:
+        kv         = context.user_data["kv"]
+        ocr_result = OCRResult(
+            markdown=context.user_data.get("markdown_text", ""),
+            key_value=kv,
+        )
+        # Run the synchronous gspread call in a thread to not block the event loop
+        await asyncio.to_thread(
+            append_results_to_sheet_sync, [ocr_result], "TELEGRAM_CORRECTED_CONFIRM"
+        )
+        context.user_data["sheets_saved"] = True
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✅ *Dữ liệu đã sửa được lưu thành công vào Google Sheets!*\n\n"
+                 "Gửi ảnh mới để tiếp tục.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logging.exception(e)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"⚠️ Lưu vào Google Sheets thất bại:\n`{str(e)}`",
+            parse_mode="Markdown",
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
+# Fallback: unexpected text outside EDIT_FIELD state
+# ─────────────────────────────────────────────
+async def handle_unexpected_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚠️ Hãy gửi ảnh để bắt đầu, hoặc dùng /cancel để huỷ thao tác hiện tại."
+    )
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+conv_handler = ConversationHandler(
+    entry_points=[
+        MessageHandler(filters.PHOTO, handle_photo),
+    ],
+    states={
+        SELECT_ENGINE: [
+            CallbackQueryHandler(handle_engine_choice, pattern="^engine:"),
+        ],
+        CONFIRM_RESULT: [
+            CallbackQueryHandler(handle_confirmation, pattern="^confirm:"),
+        ],
+        EDIT_FIELD: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_field_input),
+        ],
+        CONFIRM_SAVE: [
+            CallbackQueryHandler(handle_save_confirmation, pattern="^save:"),
+        ],
+    },
+    fallbacks=[
+        CommandHandler("cancel", cancel),
+        CommandHandler("start",  start),
+        MessageHandler(filters.PHOTO, handle_photo),  # allow sending a new photo mid-flow
+    ],
+    allow_reentry=True,
+)
+
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+app.add_handler(CommandHandler("start",  start))
+app.add_handler(CommandHandler("help",   help_cmd))
+app.add_handler(CommandHandler("cancel", cancel))
+app.add_handler(conv_handler)
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unexpected_text))
+
+print(f"🤖 Bot running | Paddle: {PADDLE_ENDPOINT} | Gemini: {GEMINI_ENDPOINT}")
+app.run_polling()

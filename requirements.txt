@@ -10,4 +10,6 @@ google-genai>=0.1.0
 tenacity>=8.0.0
 pillow>=10.0.0
 oauth2client
+python-telegram-bot
+requests
 

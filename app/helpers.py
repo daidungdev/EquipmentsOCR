@@ -484,7 +484,7 @@ def get_gspread_client():
 KEY_MAPPING = {
     "Mã MMTB": ["mã mmtb", "mã máy", "ma mmtb", "ma may"],
     "Model": ["model", "mô hình"],
-    "Xưởng": ["xưởng", "xương", "xuong"],
+    "Xưởng": ["xưởng", "xương", "xuong", 'Xương'],
     "Vị trí": ["vị trí", "trí", "vị tri", "vi tri"]
 }
 
@@ -545,41 +545,119 @@ def extract_row_data(kv: Dict[str, str]) -> List[str]:
     return [machine_name, ma_mmtb, model, xuong, vi_tri]
 
 
-def append_results_to_sheet_sync(results: List[OCRResult]):
-    """Synchronous implementation to append OCR results to Google Sheets."""
+def append_results_to_sheet_sync(
+    results: List[OCRResult],
+    source: str = "UNKNOWN",
+) -> List[str]:
+    """Synchronous implementation to append OCR results to Google Sheets.
+
+    Args:
+        results:  List of OCRResult objects to persist.
+        source:   Human-readable caller label used in log messages
+                  (e.g. 'TELEGRAM_CONFIRM', 'TELEGRAM_CORRECTED_CONFIRM').
+
+    Returns:
+        List of Mã MMTB values that were actually inserted
+        (skipped duplicates are excluded).
+    """
+    # ── Guard: sheets integration must be enabled ──────────────────────────
+    if not GOOGLE_SHEETS_ENABLED:
+        logger.warning(
+            f"[{source}] Google Sheets integration is disabled. Save skipped."
+        )
+        return []
+
     client = get_gspread_client()
     if not client:
-        logger.warning("Google Sheets integration is disabled or not configured. Skipping.")
-        return
+        logger.warning(
+            f"[{source}] gspread client unavailable. Save skipped."
+        )
+        return []
+
+    inserted_ids: List[str] = []
 
     try:
-        logger.info(f"Opening Google Sheet: '{GOOGLE_SHEETS_NAME}'...")
+        logger.info(f"[{source}] Opening Google Sheet: '{GOOGLE_SHEETS_NAME}'...")
         spreadsheet = client.open(GOOGLE_SHEETS_NAME)
-        worksheet = spreadsheet.get_worksheet(0)
-        
-        # Check if the worksheet is empty and needs headers
-        if not worksheet.get_all_values():
+        worksheet   = spreadsheet.get_worksheet(0)
+
+        # ── Ensure header row exists ───────────────────────────────────────
+        existing = worksheet.get_all_values()
+        if not existing:
             headers = ["TÊN MMTB", "Mã MMTB", "MODEL", "XƯỞNG", "VỊ TRÍ"]
-            logger.info("Sheet is empty. Appending headers...")
+            logger.info(f"[{source}] Sheet is empty — writing headers.")
             worksheet.append_row(headers)
-            
+            existing = [headers]
+
+        # ── Build set of existing Mã MMTB values (col index 1, 0-based) ───
+        # Scan up to the last 100 data rows to catch recent duplicates.
+        DEDUP_WINDOW = 100
+        data_rows  = existing[1:]          # skip header
+        recent_rows = data_rows[-DEDUP_WINDOW:] if len(data_rows) > DEDUP_WINDOW else data_rows
+        existing_ma_mmtb = {
+            row[1].strip().lower()
+            for row in recent_rows
+            if len(row) > 1 and row[1].strip()
+        }
+        logger.debug(
+            f"[{source}] Dedup window contains {len(existing_ma_mmtb)} unique Mã MMTB values."
+        )
+
+        # ── Filter out duplicates and build insert batch ───────────────────
         rows_to_insert = []
         for result in results:
-            row = extract_row_data(result.key_value)
+            row      = extract_row_data(result.key_value)
+            ma_mmtb  = row[1].strip().lower() if len(row) > 1 else ""
+
+            if ma_mmtb and ma_mmtb in existing_ma_mmtb:
+                logger.warning(
+                    f"[{source}] DUPLICATE SKIPPED — Mã MMTB '{row[1]}' "
+                    f"already exists in the last {DEDUP_WINDOW} rows."
+                )
+                continue
+
             rows_to_insert.append(row)
-            
+            if ma_mmtb:
+                existing_ma_mmtb.add(ma_mmtb)   # guard against duplicates within the same batch
+                inserted_ids.append(row[1])
+
+        # ── Batch append ───────────────────────────────────────────────────
         if rows_to_insert:
-            logger.info(f"Appending {len(rows_to_insert)} row(s) to Google Sheet '{GOOGLE_SHEETS_NAME}'...")
+            logger.info(
+                f"[{source}] Appending {len(rows_to_insert)} row(s) "
+                f"to '{GOOGLE_SHEETS_NAME}'..."
+            )
             worksheet.append_rows(rows_to_insert)
-            logger.info("Successfully appended data to Google Sheet.")
+            logger.info(
+                f"[{source}] Successfully saved {len(rows_to_insert)} row(s): "
+                f"{[r[1] for r in rows_to_insert]}"
+            )
+        else:
+            logger.info(f"[{source}] No new rows to insert (all duplicates skipped).")
+
     except Exception as exc:
-        logger.error(f"Error appending data to Google Sheet '{GOOGLE_SHEETS_NAME}': {exc}", exc_info=True)
+        logger.error(
+            f"[{source}] Error appending to '{GOOGLE_SHEETS_NAME}': {exc}",
+            exc_info=True,
+        )
+
+    return inserted_ids
 
 
-async def append_results_to_sheet(results: List[OCRResult]):
-    """Asynchronously calls the Google Sheets appending task in a worker thread."""
+async def append_results_to_sheet(
+    results: List[OCRResult],
+    source: str = "UNKNOWN",
+) -> List[str]:
+    """Async wrapper — runs append_results_to_sheet_sync in a thread pool.
+
+    NOTE: This function is intentionally NOT called by any route handler.
+    It exists only for external callers (e.g. the Telegram bot) that need
+    an async interface. Routes must NEVER call this directly.
+    """
     if not GOOGLE_SHEETS_ENABLED:
-        logger.debug("Google Sheets integration is disabled. Skipping async dispatch.")
-        return
-    await asyncio.to_thread(append_results_to_sheet_sync, results)
+        logger.debug(
+            f"[{source}] Google Sheets integration disabled. Async dispatch skipped."
+        )
+        return []
+    return await asyncio.to_thread(append_results_to_sheet_sync, results, source)
 
