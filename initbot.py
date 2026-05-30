@@ -129,35 +129,46 @@ def _get_kv(kv: dict, key: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Persistent Workshop Settings
+# Persistent User Settings  (workshops.json)
+# Key layout:
+#   "<user_id>"       → workshop name  (legacy flat string)
+#   "loc_<user_id>"   → location / Vị trí value
 # ─────────────────────────────────────────────
 WORKSHOP_FILE = "workshops.json"
 
-def save_user_workshop(user_id: int, workshop: str):
-    data = {}
+def _load_settings() -> dict:
     if os.path.exists(WORKSHOP_FILE):
         try:
             with open(WORKSHOP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                return json.load(f)
         except Exception as e:
             logging.error(f"Error reading {WORKSHOP_FILE}: {e}")
-    
-    data[str(user_id)] = workshop
+    return {}
+
+def _save_settings(data: dict):
     try:
         with open(WORKSHOP_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"Error writing to {WORKSHOP_FILE}: {e}")
 
+# ── Workshop (Xưởng) ──────────────────────────
+def save_user_workshop(user_id: int, workshop: str):
+    data = _load_settings()
+    data[str(user_id)] = workshop
+    _save_settings(data)
+
 def get_user_workshop(user_id: int) -> str:
-    if os.path.exists(WORKSHOP_FILE):
-        try:
-            with open(WORKSHOP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get(str(user_id), "")
-        except Exception as e:
-            logging.error(f"Error reading {WORKSHOP_FILE}: {e}")
-    return ""
+    return _load_settings().get(str(user_id), "")
+
+# ── Location (Vị trí) ─────────────────────────
+def save_user_location(user_id: int, location: str):
+    data = _load_settings()
+    data[f"loc_{user_id}"] = location
+    _save_settings(data)
+
+def get_user_location(user_id: int) -> str:
+    return _load_settings().get(f"loc_{user_id}", "")
 
 
 # ─────────────────────────────────────────────
@@ -177,7 +188,7 @@ def _format_result(kv: dict, markdown_text: str, engine_name: str, processing_ti
 
 
 # ─────────────────────────────────────────────
-# /create-workshop command
+# /ws command — set persistent Xưởng
 # ─────────────────────────────────────────────
 async def create_workshop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -213,6 +224,42 @@ async def create_workshop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─────────────────────────────────────────────
+# /col command — set persistent Vị trí
+# ─────────────────────────────────────────────
+async def set_location_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    match = re.match(r'^/(?:col|line)(?:\s+(.+))?$', text, re.IGNORECASE)
+
+    location_value = match.group(1).strip() if (match and match.group(1)) else ""
+    user_id = update.effective_user.id
+
+    if location_value:
+        save_user_location(user_id, location_value)
+        await update.message.reply_text(
+            f"📍 Đã thiết lập vị trí mặc định là: *{location_value}*\n"
+            "Giá trị này sẽ được tự động áp dụng và ghi đè lên vị trí khi OCR kết thúc.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+    else:
+        current_location = get_user_location(user_id)
+        if current_location:
+            await update.message.reply_text(
+                f"📍 Vị trí mặc định hiện tại của bạn: *{current_location}*\n\n"
+                "Vui lòng nhập vị trí mới muốn thiết lập (hoặc gửi /cancel để huỷ):",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "📍 Bạn chưa thiết lập vị trí mặc định.\n\n"
+                "Vui lòng nhập vị trí mới muốn thiết lập (hoặc gửi /cancel để huỷ):",
+                parse_mode="Markdown",
+            )
+        context.user_data["waiting_for_location"] = True
+        return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────
 # /start command
 # ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,7 +288,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Lệnh:*\n"
         "/start  — Bắt đầu lại\n"
         "/cancel — Huỷ thao tác hiện tại\n"
-        "/ws [tên_xưởng] — Thiết lập xưởng mặc định\n"
+        "/ws [tên\_xưởng] — Thiết lập xưởng mặc định\n"
+        "/line [vị\_trí]   — Thiết lập vị trí mặc định\n"
         "/help   — Xem hướng dẫn này",
         parse_mode="Markdown",
     )
@@ -348,6 +396,18 @@ async def handle_engine_choice(update: Update, context: ContextTypes.DEFAULT_TYP
                 del kv[k]
             kv["Xưởng"] = persistent_workshop
             logging.info(f"Overwrote workshop with persistent value: {persistent_workshop} for user {update.effective_user.id}")
+
+        # ── Apply Persistent Location Overwrite ────────
+        persistent_location = get_user_location(update.effective_user.id)
+        if persistent_location:
+            keys_to_remove = []
+            for k in kv:
+                if k.lower().strip() in ["vị trí", "vi tri", "vitri", "vi tri ", "tri"]:
+                    keys_to_remove.append(k)
+            for k in keys_to_remove:
+                del kv[k]
+            kv["Vị trí"] = persistent_location
+            logging.info(f"Overwrote location with persistent value: {persistent_location} for user {update.effective_user.id}")
 
         context.user_data["kv"]              = kv
         context.user_data["markdown_text"]   = markdown_text
@@ -750,6 +810,22 @@ async def handle_unexpected_text(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    if context.user_data.get("waiting_for_location"):
+        location_value = update.message.text.strip()
+        if not location_value:
+            await update.message.reply_text("⚠️ Vị trí không được để trống. Vui lòng nhập lại:")
+            return
+
+        user_id = update.effective_user.id
+        save_user_location(user_id, location_value)
+        context.user_data["waiting_for_location"] = False
+        await update.message.reply_text(
+            f"📍 Đã thiết lập vị trí mặc định là: *{location_value}*\n"
+            "Giá trị này sẽ được tự động áp dụng và ghi đè lên vị trí khi OCR kết thúc.",
+            parse_mode="Markdown"
+        )
+        return
+
     await update.message.reply_text(
         "⚠️ Hãy gửi ảnh để bắt đầu, hoặc dùng /cancel để huỷ thao tác hiện tại."
     )
@@ -795,6 +871,7 @@ app.add_handler(CommandHandler("start",  start))
 app.add_handler(CommandHandler("help",   help_cmd))
 app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(MessageHandler(filters.Regex(r'^/(ws)\b'), create_workshop_cmd))
+app.add_handler(MessageHandler(filters.Regex(r'^/(line)\b'), set_location_cmd))
 app.add_handler(conv_handler)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unexpected_text))
 
